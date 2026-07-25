@@ -56,6 +56,12 @@ except ValueError:
 
 DISCORD_MAX_LEN = 1900  # 디스코드 2000자 제한에 여유를 둔 값
 
+# 대용량 폴더 + tpslimit 제한 환경에서 operations/list가 오래 걸릴 수 있어 넉넉하게 설정
+try:
+  LIST_TIMEOUT = int(os.getenv("LIST_TIMEOUT", 900))
+except ValueError:
+  LIST_TIMEOUT = 900
+
 # 이전 스캔 결과(파일 목록)를 저장해 재시작 후에도 중복 알림을 막기 위한 상태 파일
 STATE_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "seen_files_state.json"
@@ -149,12 +155,16 @@ def send_discord_messages(messages):
 
 
 def refresh_rclone_vfs():
-  """Rclone 마운트/캐시 새로고침 요청 (마운트를 통해 파일에 접근하는 다른 서비스를 위해 유지)"""
-  log_print(f"[*] Rclone VFS 새로고침 요청 중... (대상 폴더: {TARGET_DIR})")
+  """Rclone 마운트/캐시 새로고침 요청 (마운트를 통해 파일에 접근하는 다른 서비스를 위해 유지)
+
+  dir 파라미터는 마운트된 fs 루트 기준 상대경로여야 하므로 TARGET_DIR(표시용 전체경로)이
+  아니라 RCLONE_REMOTE_PATH를 사용한다.
+  """
+  log_print(f"[*] Rclone VFS 새로고침 요청 중... (대상 폴더: {RCLONE_REMOTE_PATH})")
   try:
-    payload = {"dir": TARGET_DIR, "recursive": True}
+    payload = {"dir": RCLONE_REMOTE_PATH, "recursive": True}
     res = requests.post(
-        f"{RCLONE_URL}/vfs/refresh", json=payload, auth=AUTH, timeout=10
+        f"{RCLONE_URL}/vfs/refresh", json=payload, auth=AUTH, timeout=30
     )
     if res.status_code == 200:
       log_print(f"[*] Rclone VFS 새로고침 완료 성공")
@@ -177,11 +187,15 @@ def list_remote_files():
       "remote": RCLONE_REMOTE_PATH,
       "opt": {"recurse": True, "noModTime": True, "filesOnly": True},
   }
+  start = time.time()
+  # tpslimit 등으로 대용량 폴더는 목록 조회 자체가 오래 걸릴 수 있어 넉넉하게 잡음
   res = requests.post(
-      f"{RCLONE_URL}/operations/list", json=body, auth=AUTH, timeout=60
+      f"{RCLONE_URL}/operations/list", json=body, auth=AUTH, timeout=LIST_TIMEOUT
   )
   res.raise_for_status()
   data = res.json()
+  elapsed = time.time() - start
+  log_print(f"[*] 원격 목록 조회 완료 ({elapsed:.1f}초 소요)")
 
   files = {}
   for entry in data.get("list", []):
