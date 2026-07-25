@@ -21,11 +21,7 @@ Rclone RC 서버의 파일 전송/변동 내역을 실시간으로 감시하고,
  ├── rclone2webhook.env     # 설정 환경 변수 파일
  ├── rclone_log.out         # 백그라운드 실행 로그 파일
  └── venv/                  # 파이썬 가상 환경 폴더
-⚙️ 설치 및 설정 방법 (Installation & Setup)
-1. 환경 변수 설정 (rclone2webhook.env)
-스크립트와 같은 경로에 rclone2webhook.env 파일을 생성하고 아래 내용을 입력합니다. (본인 환경에 맞게 수정)
-code
-Env
+
 RCLONE_URL=http://192.168.0.90:5274
 RCLONE_AUTH_USER=
 RCLONE_AUTH_PASS=
@@ -39,33 +35,3 @@ DB_ADULT_PATH=/root/docker/BookOasis_stable/db/media_adult.db
 # 주기 설정 (초 단위)
 CHECK_INTERVAL=1800   # 30분마다 Rclone 변경 내역 확인
 REFRESH_INTERVAL=3600 # 1시간마다 Rclone VFS 새로고침
-2. 파이썬 가상 환경 생성 및 패키지 설치
-시스템 패키지 보호 정책(EXTERNALLY-MANAGED-ENVIRONMENT) 대응을 위해 가상 환경을 생성하여 패키지를 설치합니다.
-code
-Bash
-# 가상 환경 생성
-python3 -m venv venv
-
-# 가상 환경 활성화
-source venv/bin/activate
-
-# 필수 라이브러리 설치
-pip install python-dotenv requests
-🚀 실행 및 관리 방법 (Usage & Management)
-▶️ 백그라운드 실행 (24시간 자동 구동)
-터미널 창을 닫아도 백그라운드에서 계속 동작하도록 nohup으로 실행합니다.
-code
-Bash
-nohup /mnt/rclone2webhook/venv/bin/python /mnt/rclone2webhook/rclone_notifier.py > rclone_log.out 2>&1 &
-📜 실시간 로그 확인
-프로그램이 정상적으로 돌고 있는지, 어떤 폴더를 스캔 중인지 실시간 로그로 확인할 수 있습니다.
-code
-Bash
-tail -f rclone_log.out
-(로그 확인 화면에서 빠져나오려면 키보드의 Ctrl + C를 누르세요.)
-⏹️ 프로세스 종료 방법
-프로그램을 끄고 싶을 때는 아래 명령어로 프로세스를 찾아 종료합니다.
-code
-Bash
-# 프로세스 검색 후 종료
-pkill -f rclone_notifier.py
