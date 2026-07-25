@@ -1,6 +1,8 @@
 import os
 import sqlite3
 import time
+from collections import deque
+
 import requests
 from dotenv import load_dotenv
 
@@ -15,6 +17,10 @@ AUTH = (AUTH_USER, AUTH_PASS) if AUTH_USER and AUTH_PASS else None
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 TARGET_DIR = os.getenv("TARGET_DIR", "mnt/gds2/GDRIVE/READING")
+
+# BookOasis 스캔 API 설정 (하드코딩 제거 -> .env로 이동)
+BOOKOASIS_API_URL = os.getenv("BOOKOASIS_API_URL", "http://192.168.0.31:5930/api/webhook/scan")
+BOOKOASIS_API_TOKEN = os.getenv("BOOKOASIS_API_TOKEN", "")
 
 # DB 경로 설정
 DB_PATHS = {
@@ -38,6 +44,10 @@ try:
 except ValueError:
   REFRESH_INTERVAL = 3600
 
+# seen_files 최대 보관 개수 및 디스코드 메시지 청크 길이
+MAX_SEEN_FILES = 2000
+DISCORD_MAX_LEN = 1900  # 디스코드 2000자 제한에 여유를 둔 값
+
 
 def log_print(message):
   """시간을 포함하여 로그를 출력하는 함수"""
@@ -45,8 +55,28 @@ def log_print(message):
   print(f"{current_time} {message}", flush=True)
 
 
+def chunk_messages(messages, separator="\n\n----------------------------------\n\n", max_len=DISCORD_MAX_LEN):
+  """메시지 리스트를 디스코드 2000자 제한에 맞춰 여러 청크로 분할"""
+  chunks = []
+  current = ""
+
+  for msg in messages:
+    candidate = msg if not current else current + separator + msg
+
+    if len(candidate) > max_len and current:
+      chunks.append(current)
+      current = msg
+    else:
+      current = candidate
+
+  if current:
+    chunks.append(current)
+
+  return chunks
+
+
 def send_discord_notification(content):
-  """디스코드 웹훅으로 최종 결과 전송"""
+  """디스코드 웹훅으로 최종 결과 전송 (2000자 제한 대응)"""
   if not DISCORD_WEBHOOK_URL:
     log_print("[에러] DISCORD_WEBHOOK_URL이 설정되지 않았습니다.")
     return
@@ -56,6 +86,19 @@ def send_discord_notification(content):
     response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
     if response.status_code == 204:
       log_print("[디스코드 전송 성공]")
+    elif response.status_code == 429:
+      # Rate limit: 지시된 시간만큼 대기 후 1회 재시도
+      retry_after = response.json().get("retry_after", 1)
+      log_print(f"[디스코드 레이트리밋] {retry_after}초 대기 후 재시도")
+      time.sleep(float(retry_after) + 0.5)
+      retry_res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=5)
+      if retry_res.status_code == 204:
+        log_print("[디스코드 전송 성공 (재시도)]")
+      else:
+        log_print(
+            f"[디스코드 재전송 실패] 상태 코드: {retry_res.status_code}, 내용:"
+            f" {retry_res.text}"
+        )
     else:
       log_print(
           f"[디스코드 전송 실패] 상태 코드: {response.status_code}, 내용:"
@@ -63,6 +106,12 @@ def send_discord_notification(content):
       )
   except Exception as e:
     log_print(f"[디스코드 통신 에러] {e}")
+
+
+def send_discord_messages(messages):
+  """메시지 리스트를 2000자 제한에 맞춰 청크로 나눠 순서대로 전송"""
+  for chunk in chunk_messages(messages):
+    send_discord_notification(chunk)
 
 
 def refresh_rclone_vfs():
@@ -87,22 +136,27 @@ def find_library_id_from_db(db_path, folder_path):
     return None
 
   try:
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-
-    # file_path에 폴더 경로가 포함되어 있는지 조회 (LIKE 검색)
-    # 예: file_path LIKE '%mnt/gds2/GDRIVE/READING/화보/4KHD/01/DSFGDSG%'
-    query = "SELECT library_id FROM books WHERE file_path LIKE ? LIMIT 1"
-    cursor.execute(query, (f"%{folder_path}%",))
-    row = cursor.fetchone()
-
-    conn.close()
-    if row:
-      return row[0]  # library_id 반환
+    with sqlite3.connect(db_path) as conn:
+      cursor = conn.cursor()
+      # file_path에 폴더 경로가 포함되어 있는지 조회 (LIKE 검색)
+      # 예: file_path LIKE '%mnt/gds2/GDRIVE/READING/화보/4KHD/01/DSFGDSG%'
+      query = "SELECT library_id FROM books WHERE file_path LIKE ? LIMIT 1"
+      cursor.execute(query, (f"%{folder_path}%",))
+      row = cursor.fetchone()
+      return row[0] if row else None
   except Exception as e:
     log_print(f"[-] DB 조회 에러 ({db_path}): {e}")
+    return None
 
-  return None
+
+def call_bookoasis_scan_api(library_id, db_type):
+  """BookOasis 스캔 웹훅 API 호출"""
+  params = {
+      "token": BOOKOASIS_API_TOKEN,
+      "library_id": library_id,
+      "type": db_type,
+  }
+  return requests.get(BOOKOASIS_API_URL, params=params, timeout=10)
 
 
 def monitor_rclone():
@@ -115,7 +169,15 @@ def monitor_rclone():
   )
   log_print(f"==================================================")
 
+  if not BOOKOASIS_API_TOKEN:
+    log_print("[경고] BOOKOASIS_API_TOKEN이 설정되지 않았습니다. .env를 확인하세요.")
+
+  if AUTH_USER and not AUTH_PASS:
+    log_print("[경고] RCLONE_AUTH_USER만 설정되고 RCLONE_AUTH_PASS가 없어 인증 없이 요청합니다.")
+
+  # 최근 처리한 파일 기억 (set으로 존재 여부 확인 + deque로 삽입 순서 유지)
   seen_files = set()
+  seen_order = deque()
   last_refresh_time = 0
 
   while True:
@@ -141,17 +203,24 @@ def monitor_rclone():
           file_size = item.get("size", 0)
           transfer_time = item.get("time")
 
-          if file_path and file_path.startswith(TARGET_DIR):
+          # TARGET_DIR 자체이거나 TARGET_DIR + "/" 로 시작하는 경우만 매칭
+          # (예: READING2 처럼 접두어만 같은 다른 폴더를 오매칭하지 않도록)
+          if file_path and (
+              file_path == TARGET_DIR or file_path.startswith(TARGET_DIR + "/")
+          ):
             unique_key = f"{file_path}_{transfer_time}"
 
             if unique_key not in seen_files:
               seen_files.add(unique_key)
+              seen_order.append(unique_key)
 
-              if len(seen_files) > 2000:
-                seen_files.pop()
+              # 가장 오래된 항목부터 제거 (set.pop()의 임의 삭제 문제 해결)
+              while len(seen_order) > MAX_SEEN_FILES:
+                oldest = seen_order.popleft()
+                seen_files.discard(oldest)
 
               # 4단계 하위 폴더 경로로 묶기 (예: mnt/gds2/GDRIVE/READING/화보/4KHD/01/DSFGDSG)
-              relative_path = file_path[len(TARGET_DIR) :].lstrip("/")
+              relative_path = file_path[len(TARGET_DIR):].lstrip("/")
               parts = relative_path.split("/")
 
               if len(parts) >= 4:
@@ -202,11 +271,8 @@ def monitor_rclone():
               if webhook_dedup_key not in executed_webhooks:
                 executed_webhooks.add(webhook_dedup_key)
 
-                # API URL 구성
-                api_url = f"http://192.168.0.31:5930/api/webhook/scan?token=1234&library_id={library_id}&type={matched_db_type}"
-
                 try:
-                  api_res = requests.get(api_url, timeout=10)
+                  api_res = call_bookoasis_scan_api(library_id, matched_db_type)
                   if api_res.status_code == 200:
                     api_status_msg = f"스캔 API 호출 성공 ({matched_db_type.upper()})"
                     log_print(
@@ -236,12 +302,9 @@ def monitor_rclone():
             )
             discord_messages.append(msg)
 
-          # 모든 폴더 처리가 끝난 후 디스코드로 결과 일괄 발송
+          # 모든 폴더 처리가 끝난 후 디스코드로 결과 발송 (2000자 제한에 맞춰 청크 전송)
           if discord_messages:
-            final_content = "\n\n----------------------------------\n\n".join(
-                discord_messages
-            )
-            send_discord_notification(final_content)
+            send_discord_messages(discord_messages)
 
       else:
         log_print(f"[-] Rclone 서버 응답 오류 (Status Code: {trans_res.status_code})")
